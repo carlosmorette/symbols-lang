@@ -14,12 +14,18 @@ defmodule Symbols do
 
   def tokenize([], tokens, line), do: tokens ++ [new_token(line, id: :EOF)]
 
-  def tokenize([35 | rest], tokens, line) do
+  def tokenize([?# | rest], tokens, line) do
     tokenize(rest, tokens ++ [new_token(line, id: :HASHTAG)], line)
   end
 
   def tokenize([char | rest], tokens, line) when char in ?a..?z do
-    tokenize(rest, tokens ++ [new_token(line, id: :CHARACTER, value: <<char>>)], line)
+    {identifier, rest} = identifier(rest, [char])
+
+    tokenize(
+      rest,
+      tokens ++ [new_token(line, id: :IDENTIFIER, value: to_string(identifier))],
+      line
+    )
   end
 
   def tokenize([char | rest], tokens, line) when char in ?0..?9 do
@@ -77,6 +83,14 @@ defmodule Symbols do
     raise "Dont't expected '#{<<c>>}', line: #{line}"
   end
 
+  def identifier([], identifier), do: {identifier, []}
+
+  def identifier([token | rest], acc) when token in ?a..?z do
+    identifier(rest, acc ++ [token])
+  end
+
+  def identifier(tokens, identifier), do: {identifier, tokens}
+
   def string([?& | rest], acc) do
     {acc, rest}
   end
@@ -101,6 +115,8 @@ defmodule Symbols do
     %{id: id, line: line}
   end
 
+  # === Parsing ===
+
   def parse(tokens), do: parse_program(tokens, [])
 
   def parse_program([%{id: :EOF}], acc), do: acc
@@ -120,100 +136,80 @@ defmodule Symbols do
     parse_program(tokens, acc ++ [structure])
   end
 
-  def parse_decl_function(tokens) do
-    tokens = expect(tokens, :HASHTAG)
-    {fun_token, tokens} = expect_and_get(tokens, :CHARACTER)
-    {params, tokens} = parse_decl_fun_params(tokens, fun_token, [])
-    tokens = expect(tokens, :ARROBA)
-    {body, tokens} = parse_fun_body(tokens, [])
-    tokens = expect(tokens, :DOT)
-    {%{type: :fun_decl, id: fun_token, params: params, body: body}, tokens}
-  end
-
-  def parse_decl_fun_params(tokens, fun_token, params) do
-    cond do
-      match(tokens, :ARROBA) ->
-        {params, tokens}
-
-      match(tokens, :CHARACTER) and Enum.count(params) == 3 ->
-        raise "Just 3 params in ##{fun_token.value} line: #{fun_token.line}"
-
-      match(tokens, :CHARACTER) ->
-        {param, tokens} = get(tokens)
-        parse_decl_fun_params(tokens, fun_token, params ++ [param])
-    end
-  end
-
-  def parse_fun_body(tokens, acc) do
-    {structure, tokens} = parse_expression(tokens)
-
-    if match(tokens, :DOT) do
-      {acc ++ [structure], tokens}
-    else
-      parse_fun_body(tokens, acc ++ [structure])
-    end
-  end
-
   def parse_expression(tokens) do
-    case type_expression(tokens) do
-      :fun_call ->
-        {fun_call, tokens} = parse_fun_call(tokens)
-        {fun_call, tokens}
-
-      :literal ->
-        {literal, tokens} = parse_literal(tokens)
-        {literal, tokens}
-
-      :unknown ->
-        {t, _tokens} = get(tokens)
-        raise "Unexpected #{t.value || t.type} in line: #{t.line}"
-    end
-  end
-
-  def type_expression(tokens) do
-    cond do
-      fun_call?(tokens) ->
-        :fun_call
-
-      literal?(tokens) ->
-        :literal
-
-      true ->
-        :unknown
-    end
-  end
-
-  def parse_fun_call(tokens) do
     {tokens, print?} =
       if match(tokens, :EXCLAMATION) do
         {next(tokens), true}
       else
-	{tokens, false}
+        {tokens, false}
       end
 
-    tokens = expect(tokens, :DOLLAR)
-    {fun_id, tokens} = expect_and_get(tokens, [:CHARACTER, :PLUS, :MINUS, :STAR, :SLASH])
+    cond do
+      match(tokens, :DOLLAR) ->
+        parse_fun_call(tokens, print?)
 
-    if String.length(fun_id.value) == 1 do
-      {params, tokens} = parse_call_fun_params(tokens)
-      {%{type: :fun_call, id: fun_id, params: params, print: print?}, tokens}
-    else
-      raise "Invalid fun ID"
+      true ->
+        parse_literal(tokens)
     end
   end
 
-  def parse_call_fun_params(tokens, acc \\ []) do
-    {param, tokens} = expect_and_get(tokens, [:CHARACTER, :NUMBER, :STRING])
+  def parse_fun_call(tokens, print?) do
+    tokens = expect(tokens, :DOLLAR)
+    {fun_id, tokens} = expect_and_get(tokens, :IDENTIFIER)
+    tokens = expect(tokens, :STAR)
+    {params, tokens} = parse_call_fun_params(tokens)
+    tokens = expect(tokens, :STAR)
+    {%{type: :fun_call, id: fun_id, params: params, print: print?}, tokens}
+  end
+
+  def parse_call_fun_params(tokens, params \\ []) do
+    cond do
+      match(tokens, :STAR) ->
+        {params, tokens}
+
+      true ->
+        {expr, tokens} = parse_expression(tokens)
+
+        cond do
+          match(tokens, :MINUS) ->
+            parse_call_fun_params(next(tokens), params ++ [expr])
+
+          match(tokens, :STAR) ->
+            {params ++ [expr], tokens}
+        end
+    end
+  end
+
+  def parse_decl_function(tokens) do
+    tokens = expect(tokens, :HASHTAG)
+    {fun_id, tokens} = expect_and_get(tokens, :IDENTIFIER)
+    {params, tokens} = parse_decl_fun_params(tokens)
+    tokens = expect(tokens, :ARROBA)
+    {body, tokens} = parse_fun_body(tokens)
+    tokens = expect(tokens, :DOT)
+    {%{type: :fun_decl, id: fun_id, params: params, body: body}, tokens}
+  end
+
+  def parse_decl_fun_params(tokens, params \\ []) do
+    cond do
+      match(tokens, :ARROBA) ->
+        {params, tokens}
+
+      match(tokens, :MINUS) ->
+        {param_id, tokens} = expect_and_get(next(tokens), :IDENTIFIER)
+        parse_decl_fun_params(tokens, params ++ [param_id])
+    end
+  end
+
+  def parse_fun_body(tokens, expressions \\ []) do
+    {structure, tokens} = parse_expression(tokens)
 
     cond do
       match(tokens, :MINUS) ->
-        parse_call_fun_params(next(tokens), acc ++ [param])
+        parse_fun_body(next(tokens), expressions ++ [structure])
 
-      match(tokens, :STAR) ->
-        {acc ++ [param], next(tokens)}
-
-      true ->
-        raise "Error on parsing function parameters"
+      match(tokens, :DOT) ->
+        {expressions ++ [structure], tokens}
     end
   end
 
@@ -246,11 +242,9 @@ defmodule Symbols do
 
   def expect_and_get([%{id: id} = token | tokens], id), do: {token, tokens}
 
-  def expect_and_get([%{id: id} = token | tokens], ids) when is_list(ids) do
-    if id in ids, do: {token, tokens}, else: raise("Error, expected: #{inspect(ids)}, got: #{id}")
-  end
-
   def expect_and_get([%{id: got} | _tokens], id), do: raise("Error, expected: #{id}, got: #{got}")
+
+  # === Evaluation ===
 
   def eval([], _env), do: :ok
 
@@ -260,8 +254,6 @@ defmodule Symbols do
   end
 
   def do_eval(%{type: :fun_decl, id: id, params: params, body: body}, env) do
-    # TODO: adicionar nome do parametro com o prefixo sendo ele o nome da função
-
     env =
       add_curr_scope(
         env,
@@ -280,16 +272,16 @@ defmodule Symbols do
 
     {result, env} =
       cond do
-      has_function?(id, env) ->
-        fun = env.curr_scope[id]
-        env = eval_params(params, fun.params, env)
-        {result, env} = eval_list(fun.body, env)
-        {List.last(result), env}
+        has_function?(id, env) ->
+          fun = env.curr_scope[id]
+          env = eval_params(params, fun.params, env)
+          {result, env} = eval_list(fun.body, env)
+          {List.last(result), env}
 
-      is_built_in?(id) ->
-	{result, env} = eval_fun(id, params, env)
-        {result, env}
-    end
+        is_built_in?(id) ->
+          {result, env} = eval_fun(id, params, env)
+          {result, env}
+      end
 
     if print? do
       IO.puts(result)
@@ -311,6 +303,28 @@ defmodule Symbols do
     {String.to_integer(value), env}
   end
 
+  def do_eval(%{id: :IDENTIFIER, value: value}, env) do
+    case Map.get(env.curr_scope, value) do
+      nil ->
+        raise "Identifier: #{value} not found"
+
+      env_value ->
+        {env_value, env}
+    end
+  end
+
+  def do_eval(%{type: :literal, value: %{id: :NUMBER} = number}, env) do
+    do_eval(number, env)
+  end
+
+  def do_eval(%{type: :literal, value: %{id: :STRING, value: value}}, env) do
+    {value, env}
+  end
+
+  def do_eval(%{type: :literal, value: %{id: :IDENTIFIER} = id}, env) do
+    do_eval(id, env)
+  end
+
   def eval_list(data, env) do
     Enum.map_reduce(data, env, fn d, e ->
       {evtd, ne} = do_eval(d, e)
@@ -329,7 +343,7 @@ defmodule Symbols do
   end
 
   def eval_params(params, env) do
-    {Enum.map(params, fn p -> Map.get(env.curr_scope, p.value) end), env}
+    eval_list(params, env)
   end
 
   def eval_params(params, fun_params, env) do
